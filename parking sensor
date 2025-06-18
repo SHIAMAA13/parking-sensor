@@ -1,0 +1,431 @@
+#include <xc.h>
+
+// Define the crystal frequency for delay calculations
+#define _XTAL_FREQ 4000000  // 4 MHz crystal oscillator
+
+
+// MICROCONTROLLER CONFIGURATION BITS
+#pragma config FOSC = HS        // High Speed crystal oscillator
+#pragma config WDTE = OFF       // Watchdog Timer disabled
+#pragma config PWRTE = OFF      // Power-up Timer disabled
+#pragma config BOREN = ON       // Brown-out Reset enabled
+#pragma config LVP = OFF        // Low Voltage Programming disabled
+#pragma config CPD = OFF        // Data EEPROM Code Protection disabled
+#pragma config WRT = OFF        // Flash Program Memory Write disabled
+#pragma config CP = OFF         // Flash Program Memory Code Protection disabled
+
+
+// HARDWARE PIN DEFINITIONS
+// LCD Display Connections (4-bit mode) for easy control
+#define LCD_RS RB0              // Register Select: 0=Command, 1=Data
+#define LCD_EN RB1              // Enable: triggers LCD to read data
+#define LCD_D4 RB4              // Data bit 4 
+#define LCD_D5 RB5              // Data bit 5
+#define LCD_D6 RB6              // Data bit 6
+#define LCD_D7 RB7              // Data bit 7 
+
+// HC-SR04 Ultrasonic Sensor Connections
+#define TRIG RC0                // Trigger pin: sends ultrasonic pulse
+#define ECHO RC1                // Echo pin: receives reflected pulse
+
+// LED Status Indicators
+#define LED_RED RC2             // Red LED: indicates danger/caution zones
+#define LED_GREEN RC3           // Green LED: indicates safe distance
+
+
+// DISTANCE MEASUREMENT THRESHOLDS
+// These define the different zones for parking assistance
+#define STOP_DISTANCE 10        // 0-10cm: Critical stop zone
+#define SLOW_DISTANCE 20        // 10-20cm: Caution zone
+#define MAX_DISTANCE 30         // Maximum reliable measurement range
+
+
+// GLOBAL VARIABLES
+volatile unsigned int timer_duration = 0;  // Timer value for pulse width
+volatile unsigned char echo_flag = 0;      // Flag for echo pulse detection
+float distance = 0;                        // Current measured distance
+
+
+// INTERRUPT SERVICE ROUTINE
+void __interrupt() ISR(void) {
+    if (RBIF) {  // Check if PORTB change interrupt occurred
+       
+        RBIF = 0;  // Clear the interrupt flag
+    }
+}
+
+
+// LCD DISPLAY FUNCTIONS
+
+void LCD_Command(unsigned char cmd) {
+    LCD_RS = 0;                 // Select command mode, send a command to the LCD
+    
+    // Send upper 4 bits first 
+    LCD_D7 = (cmd >> 7) & 1;   // Extract and send bit 7
+    LCD_D6 = (cmd >> 6) & 1;   // Extract and send bit 6
+    LCD_D5 = (cmd >> 5) & 1;   // Extract and send bit 5
+    LCD_D4 = (cmd >> 4) & 1;   // Extract and send bit 4
+    
+    // Pulse enable pin to latch the data
+    LCD_EN = 1; 
+    __delay_us(2);              
+    LCD_EN = 0;
+
+    // Send lower 4 bits
+    LCD_D7 = (cmd >> 3) & 1;   // Extract and send bit 3
+    LCD_D6 = (cmd >> 2) & 1;   // Extract and send bit 2
+    LCD_D5 = (cmd >> 1) & 1;   // Extract and send bit 1
+    LCD_D4 = (cmd >> 0) & 1;   // Extract and send bit 0
+    
+    // Pulse enable pin again
+    LCD_EN = 1; 
+    __delay_us(2);
+    LCD_EN = 0;
+
+    __delay_ms(2);              // Wait for command execution
+}
+
+
+ // LCD RS=1 displaying actual characters on the screen
+
+void LCD_Char(unsigned char data) {
+    LCD_RS = 1;                 // Select data mode
+    
+    // Send upper 4 bits
+    LCD_D7 = (data >> 7) & 1;
+    LCD_D6 = (data >> 6) & 1;
+    LCD_D5 = (data >> 5) & 1;
+    LCD_D4 = (data >> 4) & 1;
+    LCD_EN = 1; 
+    __delay_us(2); 
+    LCD_EN = 0;
+
+    // Send lower 4 bits
+    LCD_D7 = (data >> 3) & 1;
+    LCD_D6 = (data >> 2) & 1;
+    LCD_D5 = (data >> 1) & 1;
+    LCD_D4 = (data >> 0) & 1;
+    LCD_EN = 1; 
+    __delay_us(2); 
+    LCD_EN = 0;
+
+    __delay_us(50);             
+}
+
+
+ // Display a string on the LCD
+
+void LCD_String(const char *str) {
+    while (*str) {              
+        LCD_Char(*str++);       // Send character and increment pointer
+    }
+}
+
+
+ // Set cursor position on LCD
+void LCD_SetCursor(unsigned char row, unsigned char col) {
+    unsigned char addr;
+    
+    if (row == 0) {
+        addr = 0x80 + col;      // First line starts at 0x80
+    } else {
+        addr = 0xC0 + col;      // Second line starts at 0xC0
+    }
+    
+    LCD_Command(addr);          // Send cursor position command
+}
+
+// Initialize the LCD display
+ // Sets up 4-bit mode, 2 lines, 5x8 font
+ 
+void LCD_Init(void) {
+    
+    TRISB = 0x00;               // All PORTB pins as output
+    PORTB = 0x00;               // Clear all outputs
+    __delay_ms(20);            
+
+    LCD_RS = 0;                 // Start in command mode
+    LCD_EN = 0;                 // Enable initially low
+
+    // LCD initialization sequence 
+    // Send 0x3 three times to ensure 8-bit mode is cleared
+    LCD_D7 = 0;
+    LCD_D6 = 0; 
+    LCD_D5 = 1; 
+    LCD_D4 = 1;  
+    LCD_EN = 1;
+    __delay_ms(5); 
+    LCD_EN = 0; 
+    __delay_ms(5);
+    LCD_EN = 1; 
+    __delay_ms(5);
+    LCD_EN = 0;
+    __delay_ms(5);
+    LCD_EN = 1;
+    __delay_ms(5);
+    LCD_EN = 0;
+    __delay_ms(5);
+
+    // Switch to 4-bit mode
+    LCD_D7 = 0;
+    LCD_D6 = 0; 
+    LCD_D5 = 1;
+    LCD_D4 = 0;  
+    LCD_EN = 1;
+    __delay_ms(5); 
+    LCD_EN = 0; 
+    __delay_ms(5);
+
+    // Configure LCD settings
+    LCD_Command(0x28);          // 4-bit mode, 2 lines, 5x8 font
+    LCD_Command(0x0C);          // Display on, cursor off, blink off
+    LCD_Command(0x06);          // Auto-increment cursor, no display shift
+    LCD_Command(0x01);          // Clear display and home cursor
+}
+
+
+ //Display a floating point number with one decimal place
+
+void LCD_Float(float num) {
+    // Separate integer and decimal parts
+    unsigned int integer_part = (unsigned int)num;
+    unsigned int decimal_part = (unsigned int)((num - integer_part) * 10);
+    
+    // Display integer part
+    if (integer_part == 0) {
+        LCD_Char('0');          // Handle zero case
+    } else {
+        // Convert integer to string (reverse order)
+        char buffer[4];         // Buffer for displaying the digits in the right order
+        int i = 0;
+        
+        while (integer_part > 0) {
+            buffer[i++] = (integer_part % 10) + '0';  // Extract digit
+            integer_part /= 10;
+        }
+        
+        // Display digits in correct order
+        while (i > 0) {
+            LCD_Char(buffer[--i]);
+        }
+    }
+    
+    // Display decimal point and one decimal place
+    LCD_Char('.');
+    LCD_Char(decimal_part + '0');
+}
+
+
+void LCD_ClearLine(unsigned char row) {
+    LCD_SetCursor(row, 0);      // Go to start of specified line
+    LCD_String("                "); // 16 spaces to clear line
+    LCD_SetCursor(row, 0);      // Return cursor to start of line
+}
+
+
+// ULTRASONIC DISTANCE MEASUREMENT
+
+
+
+ // Calculate distance: distance = (pulse_width * speed_of_sound) / 2
+ 
+float Get_Distance(void) {
+    unsigned long pulse_width = 0;
+    
+    // Step 1: Send trigger pulse
+    TRIG = 0;                   // Ensure trigger is low
+    __delay_us(2);              // Short delay
+    TRIG = 1;                   // Start trigger pulse
+    __delay_us(10);             // 10μs pulse width (sensor requirement)
+    TRIG = 0;                   // End trigger pulse
+    
+    // Step 2: Wait for echo to start 
+    unsigned int timeout = 0;
+    while (ECHO == 0 && timeout < 30000) {
+        timeout++;
+        __delay_us(1);
+    }
+    
+    // Check for timeout (no echo received)
+    if (timeout >= 30000) {
+        return 999.0;           // Return error value
+    }
+    
+    // Step 3: Measure echo pulse width using Timer1
+    TMR1H = 0;                  // Clear timer high byte
+    TMR1L = 0;                  // Clear timer low byte
+    T1CON = 0x01;               // Enable Timer1: internal clock
+    
+    // Wait for echo pulse to end
+    timeout = 0;
+    while (ECHO == 1 && timeout < 30000) {
+        timeout++;
+        if (timeout >= 30000) {
+            T1CON = 0x00;       // Disable timer
+            return 999.0;       // Return error value
+        }
+        __delay_us(1);
+    }
+    
+    // Step 4: Stop timer and calculate distance
+    T1CON = 0x00;               // Disable Timer1
+    pulse_width = (TMR1H << 8) | TMR1L;  // Combine high and low bytes
+    
+    // Calculate distance in centimeters
+    distance = (pulse_width * 0.034) / 2.0;
+    
+    // Validate distance range
+    if (distance < 0) distance = 0;
+    if (distance > MAX_DISTANCE) return 999.0;  // Out of range
+    
+    return distance;
+}
+
+// LED STATUS INDICATORS
+
+void Update_LEDs(float dist) {
+   
+    LED_RED = 0;
+    LED_GREEN = 0;
+    
+    // Determine LED state based on distance
+    if (dist >= 999 || dist > MAX_DISTANCE) {
+        // Out of range - no LED indication
+        return;
+    } else if (dist <= SLOW_DISTANCE) {
+        // Close distance (0-20cm) - Red LED for caution
+        LED_RED = 1;
+    } else {
+        // Safe distance (20-30cm) - Green LED
+        LED_GREEN = 1;
+    }
+}
+
+
+// ENHANCED DISPLAY SYSTEM
+void Display_Distance_Enhanced(float dist) {
+    // Static variables retain values between function calls
+    static float last_distance = -1;        // Track distance changes
+    static unsigned char last_status = 255; // Track status changes
+    unsigned char current_status;
+    
+    // Determine current status zone
+    if (dist >= 999 || dist > MAX_DISTANCE) {
+        current_status = 0;     // Out of range
+    } else if (dist <= STOP_DISTANCE) {
+        current_status = 3;     // Danger zone (0-10cm)
+    } else if (dist <= SLOW_DISTANCE) {
+        current_status = 2;     // Caution zone (10-20cm)
+    } else {
+        current_status = 1;     // Safe zone (20-30cm)
+    }
+    
+    // Update distance display only if distance changed
+    if (dist != last_distance) {
+        LCD_SetCursor(0, 0);    // First line, first column
+        LCD_String("Dist: ");
+        
+        if (current_status == 0) {
+            LCD_String("--- cm  ");  // Out of range indicator
+        } else {
+            LCD_Float(dist);         // Display actual distance
+            LCD_String(" cm  ");
+        }
+        last_distance = dist;
+    }
+    
+    // Update status display only if status changed
+    if (current_status != last_status) {
+        LCD_ClearLine(1);       // Clear second line
+        
+        // Display appropriate status message
+        switch (current_status) {
+            case 1: // Safe distance (20-30cm)
+                LCD_String("SAFE DISTANCE");
+                break;
+            case 2: // Caution zone (10-20cm)
+                LCD_String("SLOW DOWN");
+                break;
+            case 3: // Danger zone (0-10cm)
+                LCD_String("STOP");
+                break;
+            case 0: // Out of range (>30cm or error)
+                LCD_String("OUT OF RANGE");
+                break;
+        }
+        
+        // Update LED indicators
+        Update_LEDs(dist);
+        last_status = current_status;
+    }
+}
+
+
+// MAIN PROGRAM
+void main(void) {
+    float measured_distance;
+
+   
+    // SYSTEM INITIALIZATION
+    ADCON1 = 0x0F;              // Configure all pins as digital I/O
+    CMCON = 0x07;               // Disable analog comparators
+    
+    // Configure pin directions (TRIS registers)
+    TRISC0 = 0;                 // TRIG pin as output
+    TRISC1 = 1;                 // ECHO pin as input
+    TRISC2 = 0;                 // LED_RED as output
+    TRISC3 = 0;                 // LED_GREEN as output
+    
+    // Initialize port values
+    PORTB = 0x00;               // Clear PORTB
+    PORTC = 0x00;               // Clear PORTC
+    
+    // Configure Timer1 for distance measurement
+    T1CON = 0x00;               // Timer1 disabled initially
+    TMR1H = 0;                  // Clear timer high byte
+    TMR1L = 0;                  // Clear timer low byte
+    
+    // Configure interrupts (for future expansion)
+    GIE = 1;                    // Enable global interrupts
+    
+    // System startup delay
+    __delay_ms(100);
+    
+    
+    // DISPLAY INITIALIZATION
+    LCD_Init();                 // Initialize LCD display
+    
+    // Display startup message
+    LCD_String("Parking Sensor");
+    LCD_SetCursor(1, 0);
+    LCD_String("Ready");
+    __delay_ms(2000);           // Show message for 2 seconds
+    
+    LCD_Command(0x01);          // Clear display
+    
+   
+    // SYSTEM TEST SEQUENCE
+
+    // Test LED functionality
+    LED_RED = 1;                // Turn on red LED
+    __delay_ms(500);            // Wait 0.5 seconds
+    LED_RED = 0;                // Turn off red LED
+    
+    LED_GREEN = 1;              // Turn on green LED
+    __delay_ms(500);            // Wait 0.5 seconds
+    LED_GREEN = 0;              // Turn off green LED
+    
+    LCD_Command(0x01);          // Clear display for normal operation
+    
+    
+    while (1) {                 // Infinite loop for continuous operation
+        // Measure distance using ultrasonic sensor
+        measured_distance = Get_Distance();
+        
+        // Update display and LEDs based on measurement
+        Display_Distance_Enhanced(measured_distance);
+        
+        // Wait before next measurement (300ms update rate)
+        __delay_ms(300);
+    }
+}
